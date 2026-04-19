@@ -52,7 +52,8 @@ namespace PrivateLLM
             {
                 SystemPrompt = SystemPrompt,
                 UserPrompt = UserPrompt,
-                CustomParameters = UseCustomParameters ? CustomParameters : null
+                UseCustomParameters = UseCustomParameters,
+                CustomParameters = CustomParameters
             };
 
             return BulkCall(new List<Request> { singleRequest }, ModelFileURL, HFAccessToken).FirstOrDefault();
