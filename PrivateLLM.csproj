@@ -7,11 +7,13 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <None Remove="resources\privatelm_logo.png" />
+    <None Remove="resources\privatellm_logo.png" />
   </ItemGroup>
 
   <ItemGroup>
-    <EmbeddedResource Include="resources\privatelm_logo.png" />
+    <EmbeddedResource Include="resources\privatellm_logo.png">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+    </EmbeddedResource>
   </ItemGroup>
 
   <ItemGroup>
@@ -32,9 +34,6 @@
 		</ItemGroup>
 		<Copy SourceFiles="@(ExtraLibraries)" DestinationFolder="$(PublishDir)" />
 		<RemoveDir Directories="$(PublishDir)\extra" />
-		<RemoveDir Directories="$(PublishDir)\runtimes\linux-x64\native\avx" />
-		<RemoveDir Directories="$(PublishDir)\runtimes\linux-x64\native\avx512" />
-		<RemoveDir Directories="$(PublishDir)\runtimes\linux-x64\native\noavx" />
 	</Target>
 
 </Project>

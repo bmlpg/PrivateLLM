@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Net.Http.Headers;
+using System.Runtime.InteropServices;
 using LLama;
 using LLama.Common;
 using LLama.Sampling;
@@ -8,11 +9,11 @@ using Microsoft.Extensions.Logging;
 
 namespace PrivateLLM
 {
-    public class PrivateLM : IPrivateLM
+    public class PrivateLLM : IPrivateLLM
     {
         private readonly ILogger _logger;
 
-        public PrivateLM(ILogger logger)
+        public PrivateLLM(ILogger logger)
         {
             _logger = logger;
 
@@ -23,7 +24,7 @@ namespace PrivateLLM
 
                 if (!isError && !isWarning) return;
 
-                using var activity = Activity.Current?.Source.StartActivity("PrivateLM.NativeLog");
+                using var activity = Activity.Current?.Source.StartActivity("PrivateLLM.NativeLog");
 
                 if (isError)
                 {
@@ -37,13 +38,19 @@ namespace PrivateLLM
             });
         }
 
+        [DllImport("libc")]
+        public static extern int malloc_trim(uint pad);
+
         public Response Call(
             string SystemPrompt,
             string UserPrompt,
-            bool UseCustomParameters = false,
-            CustomParameters? CustomParameters = null,
+            float Temperature = 0.1f,
+            int MaxTokens = 256,
+            float TopP = 0.1f,
             string ModelFileURL = "",
-            string HFAccessToken = ""
+            string HFAccessToken = "",
+            int ContextSize = 1024,
+            int Threads = 1
         )
         {
             // Re-use BulkCall logic for a single item to ensure identical behavior
@@ -52,111 +59,99 @@ namespace PrivateLLM
             {
                 SystemPrompt = SystemPrompt,
                 UserPrompt = UserPrompt,
-                UseCustomParameters = UseCustomParameters,
-                CustomParameters = CustomParameters
+                Temperature = Temperature,
+                MaxTokens = MaxTokens,
+                TopP = TopP
             };
 
-            return BulkCall(new List<Request> { singleRequest }, ModelFileURL, HFAccessToken).FirstOrDefault();
+            return BulkCall(new List<Request> { singleRequest }, ModelFileURL, HFAccessToken, ContextSize, Threads).FirstOrDefault();
         }
 
         public List<Response> BulkCall(
             List<Request> Requests,
             string ModelFileURL = "",
-            string HFAccessToken = ""
+            string HFAccessToken = "",
+            int ContextSize = 1024,
+            int Threads = 1
         )
         {
             DownloadModel(ModelFileURL, HFAccessToken);
             var results = new List<Response>();
 
             var modelPath = Path.Combine(Path.GetTempPath(), "model.gguf");
-            var parameters = new ModelParams(modelPath) { ContextSize = 512, GpuLayerCount = 0, Threads = 1 };
+            var parameters = new ModelParams(modelPath) { ContextSize = (uint?)ContextSize, GpuLayerCount = 0, Threads = Threads };
 
             try
             {
                 using var weights = LLamaWeights.LoadFromFile(parameters);
                 var executor = new StatelessExecutor(weights, parameters);
+                var transformer = new PromptTemplateTransformer(weights, true);
 
                 foreach (var req in Requests)
                 {
                     Stopwatch sw = Stopwatch.StartNew();
-                    string result = ExecuteInference(weights, executor, req);
+                    string result = ExecuteInference(executor, transformer, req);
                     sw.Stop();
+                    var process = Process.GetCurrentProcess();
+                    process.Refresh();
 
                     results.Add(new Response
                     {
                         Result = result,
-                        Duration = sw.ElapsedMilliseconds
+                        Duration = sw.ElapsedMilliseconds,
+                        TotalMemoryMB = (int)(process.WorkingSet64 / (1024 * 1024))
                     });
                 }
             }
             finally
             {
-                GC.Collect();
-                GC.WaitForPendingFinalizers();
+                try
+                {
+                    malloc_trim(0);
+                }
+                catch
+                {
+                    /* Fallback for non-linux environments */
+                }
             }
 
             return results;
         }
 
-        private string ExecuteInference(LLamaWeights weights, StatelessExecutor executor, Request request)
+        private string ExecuteInference(StatelessExecutor executor, PromptTemplateTransformer transformer, Request request)
         {
-            if ((request.SystemPrompt.Length + request.UserPrompt.Length) > 1600)
-            {
-                throw new ArgumentException("Input is too long for the current model optimization (Max ~400 words).");
-            }
-
             var history = new ChatHistory();
             history.AddMessage(AuthorRole.System, request.SystemPrompt);
             history.AddMessage(AuthorRole.User, request.UserPrompt);
 
-            var transformer = new PromptTemplateTransformer(weights, true);
             string fullPrompt = transformer.HistoryToText(history);
 
-            int maxTokens = 256;
-            float temperature = 0.1f;
-            float topP = 0.9f;
-
-            if (request.UseCustomParameters)
+            using var pipeline = new DefaultSamplingPipeline()
             {
-                if (request.CustomParameters != null)
-                {
-                    maxTokens = request.CustomParameters.Value.MaxTokens;
-                    temperature = (float)request.CustomParameters.Value.Temperature;
-                    topP = (float)request.CustomParameters.Value.TopP;
-
-                    if (maxTokens <= 0) { maxTokens = 256; }
-                    if (temperature < 0 || temperature > 1) { temperature = 0.1f; }
-                    if (topP < 0 || topP > 1) { topP = 0.9f; }
-                }
-            }
-
-            // Extract parameters from request or use defaults
-            var inferenceParams = new InferenceParams()
-            {
-                MaxTokens = maxTokens,
-                AntiPrompts = new List<string> { "<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<start_of_turn>", "User:", "\n\n\n" },
-                SamplingPipeline = new DefaultSamplingPipeline()
-                {
-                    Temperature = temperature,
-                    TopP = topP,
-                    RepeatPenalty = 1.1f,
-                    PenalizeNewline = false
-                }
+                Temperature = request.Temperature,
+                TopP = request.TopP,
+                RepeatPenalty = 1.1f,
+                PenalizeNewline = false
             };
 
-            string result = Task.Run(async () =>
+            var inferenceParams = new InferenceParams()
             {
-                var responseBuilder = new System.Text.StringBuilder();
+                MaxTokens = request.MaxTokens,
+                AntiPrompts = new List<string> { "<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<start_of_turn>", "User:", "\n\n\n" },
+                SamplingPipeline = pipeline
+            };
 
+            var responseBuilder = new System.Text.StringBuilder();
+
+            Task.Run(async () =>
+            {
                 await foreach (var token in executor.InferAsync(fullPrompt, inferenceParams))
                 {
                     responseBuilder.Append(token);
-                }
-
-                return responseBuilder.ToString().Trim();
+                }   
             }).GetAwaiter().GetResult();
 
-            return result;
+            return responseBuilder.ToString().Trim();
         }
 
         public void Ping()
